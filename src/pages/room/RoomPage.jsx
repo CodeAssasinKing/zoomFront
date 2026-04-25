@@ -1,86 +1,85 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
+import AgoraRTC from 'agora-rtc-sdk-ng'
+import api from '../../api/api'
 import {
 	Mic,
 	MicOff,
 	Video,
 	VideoOff,
+	Monitor,
+	MonitorOff,
 	PhoneOff,
 	MessageSquare,
 	X,
 	Send,
 	Video as VideoIcon,
-	PresentationIcon,
+	Presentation,
+	Users,
 	Wifi,
 	WifiOff,
 	Loader2,
-	Users,
 } from 'lucide-react'
-import api from '../../api/api'
 import Whiteboard from './Whiteboard'
 
-const rawWsUrl = import.meta.env.VITE_API_WS_URL.replace(/^https?:\/\//, '')
+// ─────────────────────────────────────────────────────────────────────────────
+// Your FastAPI router is:  prefix="/rooms"  →  GET /rooms/agora-token/
+// ─────────────────────────────────────────────────────────────────────────────
+const APP_ID = 'f761c240f7164bf293c1cb58eb3c5e8d'
+const TOKEN_URL = '/rooms/agora-token/'
 
-// ── ICE / TURN config ─────────────────────────────────────────────────────────
-// Uses Metered's free STUN/TURN endpoints as reliable fallback beyond Google STUN.
-// Replace with your own TURN credentials for production.
-const RTC_CONFIG = {
-	iceServers: [
-		{ urls: 'stun:stun.l.google.com:19302' },
-		{ urls: 'stun:stun1.l.google.com:19302' },
-		{ urls: 'stun:stun.relay.metered.ca:80' },
-		{
-			urls: 'turn:global.relay.metered.ca:80',
-			username: 'openrelayproject',
-			credential: 'openrelayproject',
-		},
-		{
-			urls: 'turn:global.relay.metered.ca:443',
-			username: 'openrelayproject',
-			credential: 'openrelayproject',
-		},
-		{
-			urls: 'turns:global.relay.metered.ca:443',
-			username: 'openrelayproject',
-			credential: 'openrelayproject',
-		},
-	],
-	iceCandidatePoolSize: 10,
+// Fetch a fresh RTC token from your FastAPI backend before every join.
+// This is what fixes CAN_NOT_GET_GATEWAY_SERVER — we never use a stale
+// or null token when the project has App Certificate enabled.
+const fetchAgoraToken = async (channel, uid = 0) => {
+	const qs = new URLSearchParams({ channel, uid: String(uid) })
+	// CORRECT — axios auto-parses JSON, data is already the object
+	const { data } = await api.get(TOKEN_URL, { params: { channel, uid } })
+	if (!data?.token) throw new Error('Backend returned no token')
+	return { token: data.token, uid: data.uid ?? uid }
 }
 
-// ── RoomPage ──────────────────────────────────────────────────────────────────
+// sessionStorage helpers — same keys your original chat.js used
+const ssGet = key => sessionStorage.getItem(key) ?? null
+const getName = () => ssGet('username') ?? 'Unknown'
+
+// ─────────────────────────────────────────────────────────────────────────────
 const RoomPage = () => {
 	const { roomCode } = useParams()
 	const navigate = useNavigate()
 
-	// Refs
-	const localVideoRef = useRef(null)
-	const remoteVideoRef = useRef(null)
-	const peerConnection = useRef(null)
-	const socket = useRef(null)
-	const localStream = useRef(null)
-	const messagesEndRef = useRef(null)
-	const pendingCandidates = useRef([])
-	// Keep latest user/handler in refs to avoid stale closures in onmessage
-	const userRef = useRef(null)
-	const handleSignalingRef = useRef(null)
+	// Agora refs — created inside the effect, never at module level
+	// (module-level singletons break React StrictMode double-mount)
+	const clientRef = useRef(null)
+	const localTracksRef = useRef([]) // [micTrack, camTrack]
+	const screenTrackRef = useRef(null)
+	const remoteUsersRef = useRef({}) // uid → AgoraRTCRemoteUser
+	const myUidRef = useRef(null) // numeric UID assigned by Agora
 
-	// State
+	// WebSocket ref (chat + whiteboard draw signals)
+	const socket = useRef(null)
+	const messagesEndRef = useRef(null)
+
+	// Prevent double-join in React StrictMode
+	const hasJoined = useRef(false)
+	const hasLeft = useRef(false)
+
+	// ── UI state ──────────────────────────────────────────────────────────────
+	const [remoteVideos, setRemoteVideos] = useState([]) // [{ uid, username }]
 	const [messages, setMessages] = useState([])
 	const [input, setInput] = useState('')
 	const [user, setUser] = useState(null)
 	const [loading, setLoading] = useState(true)
-	const [cameraError, setCameraError] = useState(false)
-	const [activeTab, setActiveTab] = useState('video')
-	const [remoteConnected, setRemoteConnected] = useState(false)
+	const [errorMsg, setErrorMsg] = useState('')
 	const [audioMuted, setAudioMuted] = useState(false)
 	const [videoOff, setVideoOff] = useState(false)
+	const [screenSharing, setScreenSharing] = useState(false)
 	const [chatOpen, setChatOpen] = useState(false)
 	const [unreadCount, setUnreadCount] = useState(0)
-	// 'waiting' | 'connecting' | 'connected' | 'disconnected'
-	const [connState, setConnState] = useState('waiting')
+	const [activeTab, setActiveTab] = useState('video')
+	const [connState, setConnState] = useState('connecting')
 
-	// ── scroll chat ────────────────────────────────────────────────────────
+	// ── Auto-scroll chat ───────────────────────────────────────────────────────
 	useEffect(() => {
 		if (chatOpen) {
 			messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -88,272 +87,306 @@ const RoomPage = () => {
 		}
 	}, [messages, chatOpen])
 
-	// ── peer connection factory ────────────────────────────────────────────
-	const createPeerConnection = useCallback(() => {
-		peerConnection.current?.close()
-
-		const pc = new RTCPeerConnection(RTC_CONFIG)
-
-		if (localStream.current) {
-			localStream.current
-				.getTracks()
-				.forEach(t => pc.addTrack(t, localStream.current))
+	// ── Resolve display name for a remote Agora UID ───────────────────────────
+	const fetchUsername = async uid => {
+		try {
+			const res = await fetch(`/chat/get_username_by_uid/?uid=${uid}`)
+			const data = await res.json()
+			return data.username || String(uid)
+		} catch {
+			return String(uid)
 		}
-
-		pc.ontrack = e => {
-			if (remoteVideoRef.current && e.streams?.[0]) {
-				remoteVideoRef.current.srcObject = e.streams[0]
-				setRemoteConnected(true)
-				setConnState('connected')
-			}
-		}
-
-		pc.onicecandidate = e => {
-			if (e.candidate && socket.current?.readyState === WebSocket.OPEN) {
-				socket.current.send(
-					JSON.stringify({ type: 'candidate', candidate: e.candidate }),
-				)
-			}
-		}
-
-		pc.onconnectionstatechange = () => {
-			const s = pc.connectionState
-			if (s === 'connected') {
-				setConnState('connected')
-				setRemoteConnected(true)
-			}
-			if (s === 'disconnected' || s === 'failed' || s === 'closed') {
-				setConnState('disconnected')
-				setRemoteConnected(false)
-				if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null
-			}
-		}
-
-		// Also watch ICE connection state for faster "connected" detection
-		pc.oniceconnectionstatechange = () => {
-			if (
-				pc.iceConnectionState === 'connected' ||
-				pc.iceConnectionState === 'completed'
-			) {
-				setConnState('connected')
-				setRemoteConnected(true)
-			}
-			if (pc.iceConnectionState === 'failed') {
-				pc.restartIce()
-			}
-		}
-
-		peerConnection.current = pc
-		return pc
-	}, [])
-
-	// ── flush queued ICE candidates ────────────────────────────────────────
-	const flushCandidates = async () => {
-		const pc = peerConnection.current
-		if (!pc?.remoteDescription) return
-		for (const c of pendingCandidates.current) {
-			await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {})
-		}
-		pendingCandidates.current = []
 	}
 
-	// ── initiate call (teacher) ────────────────────────────────────────────
-	const initiateCall = useCallback(async () => {
-		const pc = createPeerConnection()
-		const offer = await pc.createOffer()
-		await pc.setLocalDescription(offer)
-		socket.current?.send(JSON.stringify({ type: 'offer', offer }))
-	}, [createPeerConnection])
+	// ── Remote user published a track ─────────────────────────────────────────
+	const handleUserJoin = useCallback(async (agoraUser, mediaType) => {
+		const client = clientRef.current
+		if (!client) return
 
-	// ── signaling handler ──────────────────────────────────────────────────
-	// Defined as a stable ref-based function so it always sees latest state
-	// without the onmessage closure going stale.
-	const handleSignaling = useCallback(
-		async data => {
-			const currentUser = userRef.current
+		remoteUsersRef.current[agoraUser.uid] = agoraUser
+		await client.subscribe(agoraUser, mediaType)
 
-			switch (data.type) {
-				case 'system': {
-					setMessages(prev => [
-						...prev,
-						{ type: 'system', content: data.content },
-					])
-					if (
-						data.content?.includes('joined') &&
-						currentUser?.role === 'teacher'
-					) {
-						setConnState('connecting')
-						await initiateCall()
-					}
-					break
-				}
-				case 'offer': {
-					setConnState('connecting')
-					const pc = createPeerConnection()
-					await pc.setRemoteDescription(new RTCSessionDescription(data.offer))
-					await flushCandidates()
-					const answer = await pc.createAnswer()
-					await pc.setLocalDescription(answer)
-					socket.current?.send(JSON.stringify({ type: 'answer', answer }))
-					break
-				}
-				case 'answer': {
-					const pc = peerConnection.current
-					if (pc?.signalingState === 'have-local-offer') {
-						await pc.setRemoteDescription(
-							new RTCSessionDescription(data.answer),
-						)
-						await flushCandidates()
-					}
-					break
-				}
-				case 'candidate': {
-					const pc = peerConnection.current
-					if (pc?.remoteDescription) {
-						await pc
-							.addIceCandidate(new RTCIceCandidate(data.candidate))
-							.catch(() => {})
-					} else {
-						pendingCandidates.current.push(data.candidate)
-					}
-					break
-				}
-				case 'chat': {
-					setMessages(prev => [...prev, data])
-					setUnreadCount(n => n + 1)
-					break
-				}
-			}
-		},
-		[createPeerConnection, initiateCall],
-	)
+		if (mediaType === 'video') {
+			const username = await fetchUsername(agoraUser.uid)
+			setRemoteVideos(prev => {
+				const rest = prev.filter(u => u.uid !== agoraUser.uid)
+				return [...rest, { uid: agoraUser.uid, username }]
+			})
+			// Give React one frame to render the container div, then play into it
+			requestAnimationFrame(() => {
+				agoraUser.videoTrack?.play(`remote-video-${agoraUser.uid}`)
+			})
+		}
+		if (mediaType === 'audio') {
+			agoraUser.audioTrack?.play()
+		}
+	}, [])
 
-	// Keep the ref in sync with the latest callback
-	useEffect(() => {
-		handleSignalingRef.current = handleSignaling
-	}, [handleSignaling])
+	// ── Remote user left ──────────────────────────────────────────────────────
+	const handleUserLeft = useCallback(async agoraUser => {
+		delete remoteUsersRef.current[agoraUser.uid]
+		setRemoteVideos(prev => prev.filter(u => u.uid !== agoraUser.uid))
+	}, [])
 
-	// ── room setup ────────────────────────────────────────────────────────
-	useEffect(() => {
-		let alive = true
+	// ── Idempotent cleanup ────────────────────────────────────────────────────
+	const cleanup = useCallback(async () => {
+		if (hasLeft.current) return
+		hasLeft.current = true
 
-		const setup = async () => {
+		const client = clientRef.current
+
+		localTracksRef.current.forEach(t => {
 			try {
-				const { data: me } = await api.get('/auth/me')
-				if (!alive) return
-				userRef.current = me
+				t.stop()
+				t.close()
+			} catch {}
+		})
+		localTracksRef.current = []
+
+		if (screenTrackRef.current) {
+			try {
+				screenTrackRef.current.stop()
+				screenTrackRef.current.close()
+			} catch {}
+			screenTrackRef.current = null
+		}
+
+		if (client) {
+			client.off('user-published', handleUserJoin)
+			client.off('user-left', handleUserLeft)
+			try {
+				await client.leave()
+			} catch {}
+		}
+
+		socket.current?.close()
+	}, [handleUserJoin, handleUserLeft])
+
+	// ── Leave room ────────────────────────────────────────────────────────────
+	const leaveRoom = useCallback(async () => {
+		await cleanup()
+		navigate('/dashboard')
+	}, [cleanup, navigate])
+
+	// ── Bootstrap — runs exactly once per mount ────────────────────────────────
+	useEffect(() => {
+		// StrictMode calls effects twice in dev; guard with a ref
+		if (hasJoined.current) return
+		hasJoined.current = true
+
+		// Fresh Agora client for this component instance
+		const client = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' })
+		clientRef.current = client
+
+		const boot = async () => {
+			try {
+				// ── Step 1: Resolve current user ──────────────────────────────────
+				let me = {
+					id: ssGet('UID'),
+					username: getName(),
+					role: ssGet('role') ?? 'student',
+				}
+				try {
+					const { default: api } = await import('../../api/api')
+					const res = await api.get('/auth/me')
+					me = res.data
+				} catch {
+					// No API available — fall back to sessionStorage values
+				}
 				setUser(me)
 
-				// Media
-				try {
-					localStream.current = await navigator.mediaDevices.getUserMedia({
-						video: true,
-						audio: true,
-					})
-					if (localVideoRef.current)
-						localVideoRef.current.srcObject = localStream.current
-				} catch {
-					setCameraError(true)
-				}
-
-				// WebSocket
-				const ws = new WebSocket(`wss://${rawWsUrl}/ws/${roomCode}/${me.id}`)
-				socket.current = ws
-
-				ws.onopen = () => {
-					if (alive) setLoading(false)
-				}
-				ws.onclose = () => {
-					if (alive) setConnState(s => (s !== 'connected' ? s : 'disconnected'))
-				}
-				ws.onerror = () => {
-					if (alive) setConnState('disconnected')
-				}
-
-				// Always delegate to the ref so we never have a stale closure
-				ws.onmessage = async event => {
-					if (!alive) return
-					try {
-						const data = JSON.parse(event.data)
-						await handleSignalingRef.current(data)
-					} catch {
-						/* ignore malformed */
+				// ── Step 2: WebSocket for chat + whiteboard ───────────────────────
+				const rawWsBase = (import.meta.env.VITE_API_WS_URL ?? '').replace(
+					/^https?:\/\//,
+					'',
+				)
+				if (rawWsBase && me?.id) {
+					const ws = new WebSocket(`wss://${rawWsBase}/ws/${roomCode}/${me.id}`)
+					socket.current = ws
+					ws.onmessage = event => {
+						try {
+							const data = JSON.parse(event.data)
+							if (data.type === 'chat') {
+								setMessages(prev => [...prev, data])
+								setUnreadCount(n => n + 1)
+							} else if (data.type === 'system') {
+								setMessages(prev => [
+									...prev,
+									{ type: 'system', content: data.content },
+								])
+							}
+							// draw_stroke / draw_shape / clear_board are
+							// consumed directly by <Whiteboard> via the socket ref
+						} catch {}
 					}
 				}
-			} catch {
-				navigate('/dashboard')
+
+				// ── Step 3: Attach Agora event handlers ───────────────────────────
+				client.on('user-published', handleUserJoin)
+				client.on('user-left', handleUserLeft)
+
+				// ── Step 4: Fetch fresh RTC token from your FastAPI backend ────────
+				//
+				// This is the critical fix.
+				// Your endpoint: GET /rooms/agora-token/?channel=<name>&uid=0
+				// Returns:       { token: "007eJx...", uid: 0, channel: "..." }
+				//
+				// We always fetch a fresh token — never use a cached/sessionStorage
+				// one, because Agora tokens expire and using a stale token causes
+				// CAN_NOT_GET_GATEWAY_SERVER.
+				//
+				// uid=0 tells Agora to auto-assign a numeric UID, which is returned
+				// in the join() promise. We store it in myUidRef so screen share
+				// and other per-user logic can reference it.
+				const channel = roomCode
+				const { token, uid: resolvedUid } = await fetchAgoraToken(channel, 0)
+
+				const assignedUid = await client.join(
+					APP_ID,
+					channel,
+					token,
+					resolvedUid || null,
+				)
+				myUidRef.current = assignedUid
+
+				// ── Step 5: Create microphone + camera tracks ──────────────────────
+				const [micTrack, camTrack] =
+					await AgoraRTC.createMicrophoneAndCameraTracks(
+						{
+							// Audio processing — same as your original chat.js
+							AEC: true, // Acoustic Echo Cancellation
+							AGC: true, // Automatic Gain Control
+							ANS: true, // Automatic Noise Suppression
+						},
+						{
+							encoderConfig: '720p_1',
+							facingMode: 'user',
+						},
+					)
+
+				localTracksRef.current = [micTrack, camTrack]
+
+				// Play local video into its container div
+				requestAnimationFrame(() => camTrack.play('local-video'))
+
+				// ── Step 6: Publish to channel ──────────────────────────────────
+				await client.publish([micTrack, camTrack])
+
+				setConnState('live')
+				setLoading(false)
+			} catch (err) {
+				console.error('[RoomPage] Boot error:', err)
+				setErrorMsg(err?.message ?? 'Unknown error')
+				setConnState('error')
+				setLoading(false)
 			}
 		}
 
-		setup()
-
+		boot()
 		return () => {
-			alive = false
-			socket.current?.close()
-			peerConnection.current?.close()
-			localStream.current?.getTracks().forEach(t => t.stop())
+			cleanup()
 		}
-	}, [roomCode, navigate])
+	}, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-	// ── chat send ─────────────────────────────────────────────────────────
-	const sendChat = () => {
-		if (!input.trim() || socket.current?.readyState !== WebSocket.OPEN) return
-		const msg = {
-			type: 'chat',
-			content: input.trim(),
-			sender: user?.username ?? 'Unknown',
+	// ── Toggle microphone ──────────────────────────────────────────────────────
+	const toggleAudio = async () => {
+		const mic = localTracksRef.current[0]
+		if (!mic) return
+		const next = !audioMuted
+		await mic.setMuted(next)
+		setAudioMuted(next)
+	}
+
+	// ── Toggle camera ──────────────────────────────────────────────────────────
+	const toggleVideo = async () => {
+		const cam = localTracksRef.current[1]
+		if (!cam || screenSharing) return
+		const next = !videoOff
+		await cam.setMuted(next)
+		setVideoOff(next)
+	}
+
+	// ── Screen share — mirrors your original toggleScreenShare logic ───────────
+	const toggleScreenShare = async () => {
+		const client = clientRef.current
+		if (!client) return
+
+		if (!screenSharing) {
+			try {
+				const cam = localTracksRef.current[1]
+				await cam.setMuted(true)
+				await client.unpublish([cam])
+
+				const sTrack = await AgoraRTC.createScreenVideoTrack(
+					{ encoderConfig: '1080p_1' },
+					'disable',
+				)
+				screenTrackRef.current = sTrack
+				await client.publish([sTrack])
+
+				requestAnimationFrame(() => sTrack.play('local-video'))
+
+				// Handle user clicking browser's native "Stop sharing" button
+				sTrack.on('track-ended', () => toggleScreenShare())
+
+				setScreenSharing(true)
+				setVideoOff(false)
+			} catch (err) {
+				console.error('[RoomPage] Screen share error:', err)
+				// Restore camera if screen share was denied / failed
+				const cam = localTracksRef.current[1]
+				if (cam) {
+					await cam.setMuted(false).catch(() => {})
+					await client.publish([cam]).catch(() => {})
+					requestAnimationFrame(() => cam.play('local-video'))
+				}
+			}
+		} else {
+			const sTrack = screenTrackRef.current
+			const cam = localTracksRef.current[1]
+
+			if (sTrack) {
+				sTrack.off('track-ended')
+				await client.unpublish([sTrack]).catch(() => {})
+				sTrack.stop()
+				sTrack.close()
+				screenTrackRef.current = null
+			}
+
+			if (cam) {
+				await cam.setMuted(false).catch(() => {})
+				await client.publish([cam]).catch(() => {})
+				requestAnimationFrame(() => cam.play('local-video'))
+			}
+
+			setScreenSharing(false)
+			setVideoOff(false)
 		}
+	}
+
+	// ── Send chat message ──────────────────────────────────────────────────────
+	const sendChat = () => {
+		const content = input.trim()
+		if (!content || socket.current?.readyState !== WebSocket.OPEN) return
+		const sender = user?.username ?? getName()
+		const msg = { type: 'chat', content, sender }
 		socket.current.send(JSON.stringify(msg))
 		setMessages(prev => [...prev, { ...msg, isSelf: true }])
 		setInput('')
 	}
 
-	// ── media toggles ─────────────────────────────────────────────────────
-	const toggleAudio = () => {
-		localStream.current?.getAudioTracks().forEach(t => (t.enabled = audioMuted))
-		setAudioMuted(m => !m)
-	}
-	const toggleVideo = () => {
-		localStream.current?.getVideoTracks().forEach(t => (t.enabled = videoOff))
-		setVideoOff(v => !v)
-	}
+	// ── Video grid column layout ───────────────────────────────────────────────
+	const totalVideos = 1 + remoteVideos.length
+	const gridCols =
+		totalVideos === 1
+			? 'grid-cols-1'
+			: totalVideos === 2
+				? 'grid-cols-1 md:grid-cols-2'
+				: totalVideos <= 4
+					? 'grid-cols-2'
+					: 'grid-cols-2 lg:grid-cols-3'
 
-	const openChat = () => {
-		setChatOpen(true)
-		setUnreadCount(0)
-	}
-
-	// ── status badge ──────────────────────────────────────────────────────
-	const StatusBadge = () => {
-		const map = {
-			waiting: { label: 'Waiting', color: 'text-amber-400', Icon: Users },
-			connecting: {
-				label: 'Connecting…',
-				color: 'text-blue-400',
-				Icon: Loader2,
-			},
-			connected: { label: 'Live', color: 'text-emerald-400', Icon: Wifi },
-			disconnected: {
-				label: 'Disconnected',
-				color: 'text-rose-400',
-				Icon: WifiOff,
-			},
-		}
-		const { label, color, Icon } = map[connState] ?? map.waiting
-		return (
-			<div
-				className={`flex items-center gap-1.5 text-xs font-semibold ${color}`}
-			>
-				<Icon
-					size={13}
-					className={connState === 'connecting' ? 'animate-spin' : ''}
-				/>
-				{label}
-			</div>
-		)
-	}
-
-	// ── Loading ───────────────────────────────────────────────────────────
+	// ── Loading screen ─────────────────────────────────────────────────────────
 	if (loading) {
 		return (
 			<div className='h-screen bg-slate-950 flex flex-col items-center justify-center text-white gap-5'>
@@ -361,59 +394,121 @@ const RoomPage = () => {
 					<div className='absolute inset-0 rounded-full border-4 border-slate-800' />
 					<div className='absolute inset-0 rounded-full border-4 border-blue-500 border-t-transparent animate-spin' />
 				</div>
-				<div className='text-center'>
-					<p className='text-sm font-bold tracking-widest uppercase'>
-						Initialising Room
+				<div className='text-center space-y-1'>
+					<p className='text-sm font-bold tracking-widest uppercase text-slate-300'>
+						Joining Room
 					</p>
-					<p className='text-xs text-slate-500 mt-1 font-mono'>{roomCode}</p>
+					<p className='text-xs text-slate-600 font-mono'>{roomCode}</p>
+					<p className='text-[10px] text-slate-700'>Fetching Agora token…</p>
 				</div>
 			</div>
 		)
 	}
 
-	// ── Main UI ───────────────────────────────────────────────────────────
+	// ── Error screen ───────────────────────────────────────────────────────────
+	if (connState === 'error') {
+		return (
+			<div className='h-screen bg-slate-950 flex flex-col items-center justify-center text-white gap-5 px-6'>
+				<WifiOff size={40} className='text-rose-500' />
+				<div className='text-center space-y-2'>
+					<p className='text-sm font-bold text-slate-200'>
+						Failed to join room
+					</p>
+					{errorMsg && (
+						<p className='text-xs text-rose-400 font-mono bg-rose-500/10 border border-rose-500/20 px-4 py-2 rounded-xl max-w-md'>
+							{errorMsg}
+						</p>
+					)}
+					<p className='text-xs text-slate-500'>
+						Make sure your Agora App Certificate is enabled and the backend is
+						reachable.
+					</p>
+				</div>
+				<button
+					onClick={() => navigate('/dashboard')}
+					className='px-6 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-xl text-sm font-bold transition-all'
+				>
+					Back to Dashboard
+				</button>
+			</div>
+		)
+	}
+
+	// ── Main UI ────────────────────────────────────────────────────────────────
 	return (
 		<div className='h-screen bg-slate-950 text-white flex flex-col overflow-hidden'>
-			{/* Ambient */}
+			{/* Ambient glows */}
 			<div className='pointer-events-none fixed inset-0 overflow-hidden'>
-				<div className='absolute -top-40 left-1/3 w-[600px] h-[600px] bg-blue-700/8 blur-[160px] rounded-full' />
-				<div className='absolute -bottom-40 right-1/3 w-[500px] h-[500px] bg-violet-700/8 blur-[130px] rounded-full' />
+				<div className='absolute -top-48 left-1/4 w-[700px] h-[700px] bg-blue-700/[0.07] blur-[180px] rounded-full' />
+				<div className='absolute -bottom-48 right-1/4 w-[500px] h-[500px] bg-indigo-700/[0.07] blur-[150px] rounded-full' />
 			</div>
 
-			{/* ── Header ── */}
-			<header className='relative z-10 shrink-0 px-4 sm:px-6 py-3 flex items-center justify-between border-b border-white/[0.06] bg-slate-950/80 backdrop-blur-xl'>
-				<div className='flex items-center gap-3 sm:gap-5 min-w-0'>
+			{/* ── Header ─────────────────────────────────────────────────────────── */}
+			<header className='relative z-20 shrink-0 px-4 sm:px-6 py-3 flex items-center justify-between border-b border-white/[0.06] bg-slate-950/90 backdrop-blur-xl'>
+				<div className='flex items-center gap-3 sm:gap-4 min-w-0'>
 					{/* Brand */}
 					<div className='flex items-center gap-2 shrink-0'>
-						<div className='w-7 h-7 rounded-lg bg-blue-600 flex items-center justify-center font-black text-xs'>
+						<div className='w-7 h-7 rounded-lg bg-blue-600 flex items-center justify-center font-black text-xs select-none'>
 							C
 						</div>
-						<span className='text-sm font-black tracking-tight hidden md:block'>
+						<span className='text-sm font-black tracking-tight hidden lg:block'>
 							ClassRoom
 						</span>
 					</div>
 
-					<div className='w-px h-4 bg-white/10 hidden sm:block shrink-0' />
+					<div className='w-px h-4 bg-white/10 hidden sm:block' />
 
 					{/* Room code */}
-					<div className='min-w-0 hidden sm:block'>
-						<p className='text-[9px] text-slate-500 font-semibold uppercase tracking-widest'>
+					<div className='hidden sm:block'>
+						<p className='text-[9px] text-slate-600 font-semibold uppercase tracking-widest'>
 							Room
 						</p>
-						<p className='text-xs font-black font-mono truncate'>{roomCode}</p>
+						<p className='text-xs font-black font-mono'>{roomCode}</p>
 					</div>
 
-					<div className='w-px h-4 bg-white/10 hidden sm:block shrink-0' />
-					<StatusBadge />
+					<div className='w-px h-4 bg-white/10 hidden sm:block' />
+
+					{/* Connection status */}
+					<div
+						className={`flex items-center gap-1.5 text-xs font-semibold ${
+							connState === 'live'
+								? 'text-emerald-400'
+								: connState === 'error'
+									? 'text-rose-400'
+									: 'text-amber-400'
+						}`}
+					>
+						{connState === 'live' && (
+							<>
+								<Wifi size={13} /> Live
+							</>
+						)}
+						{connState === 'error' && (
+							<>
+								<WifiOff size={13} /> Error
+							</>
+						)}
+						{connState === 'connecting' && (
+							<>
+								<Loader2 size={13} className='animate-spin' /> Connecting
+							</>
+						)}
+					</div>
+
+					{/* Participant count */}
+					<div className='flex items-center gap-1.5 text-xs text-slate-500 font-semibold'>
+						<Users size={13} />
+						<span>{totalVideos}</span>
+					</div>
 				</div>
 
 				<div className='flex items-center gap-2'>
-					{/* Tabs */}
-					<div className='flex bg-slate-900 p-1 rounded-xl border border-white/[0.07] gap-1'>
+					{/* Tab switcher */}
+					<div className='flex bg-slate-900/80 p-1 rounded-xl border border-white/[0.07] gap-1'>
 						<button
 							onClick={() => setActiveTab('video')}
 							className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all
-								${activeTab === 'video' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}`}
+								${activeTab === 'video' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'}`}
 						>
 							<VideoIcon size={13} />
 							<span className='hidden sm:inline'>Video</span>
@@ -421,16 +516,19 @@ const RoomPage = () => {
 						<button
 							onClick={() => setActiveTab('board')}
 							className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all
-								${activeTab === 'board' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}`}
+								${activeTab === 'board' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'}`}
 						>
-							<PresentationIcon size={13} />
+							<Presentation size={13} />
 							<span className='hidden sm:inline'>Board</span>
 						</button>
 					</div>
 
-					{/* Chat toggle button */}
+					{/* Chat toggle */}
 					<button
-						onClick={openChat}
+						onClick={() => {
+							setChatOpen(o => !o)
+							setUnreadCount(0)
+						}}
 						className='relative w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 border border-white/[0.07] flex items-center justify-center transition-all'
 					>
 						<MessageSquare size={16} className='text-slate-300' />
@@ -443,7 +541,7 @@ const RoomPage = () => {
 
 					{/* Leave */}
 					<button
-						onClick={() => navigate('/dashboard')}
+						onClick={leaveRoom}
 						className='flex items-center gap-1.5 px-3 py-2 rounded-xl bg-rose-500/10 hover:bg-rose-500 text-rose-400 hover:text-white border border-rose-500/20 text-xs font-bold transition-all'
 					>
 						<PhoneOff size={13} />
@@ -452,101 +550,136 @@ const RoomPage = () => {
 				</div>
 			</header>
 
-			{/* ── Body ── */}
+			{/* ── Body ───────────────────────────────────────────────────────────── */}
 			<div className='relative z-10 flex flex-grow overflow-hidden p-3 sm:p-4 gap-4'>
-				{/* Main area */}
-				<div className='flex-grow flex flex-col gap-4 min-w-0 overflow-hidden'>
+				{/* Main content area */}
+				<div className='flex-grow flex flex-col gap-3 min-w-0 overflow-hidden'>
 					{activeTab === 'video' ? (
 						<>
-							<div className='flex-grow grid grid-cols-1 md:grid-cols-2 gap-4 min-h-0'>
-								{/* Local */}
-								<div className='relative bg-slate-900 rounded-2xl border border-white/[0.06] overflow-hidden flex items-center justify-center min-h-[160px]'>
-									{cameraError || videoOff ? (
-										<div className='flex flex-col items-center gap-3'>
-											<div className='w-14 h-14 rounded-full bg-slate-800 flex items-center justify-center text-xl font-black text-slate-400'>
-												{user?.username?.[0]?.toUpperCase() ?? '?'}
+							{/* ── Video grid ── */}
+							<div className={`flex-grow grid ${gridCols} gap-3 min-h-0`}>
+								{/* Local video */}
+								<div className='relative bg-slate-900 rounded-2xl border border-white/[0.06] overflow-hidden flex items-center justify-center min-h-[140px]'>
+									{/* Agora plays into this div */}
+									<div
+										id='local-video'
+										className={`w-full h-full ${videoOff && !screenSharing ? 'hidden' : ''}`}
+									/>
+
+									{/* Avatar when camera off */}
+									{videoOff && !screenSharing && (
+										<div className='flex flex-col items-center gap-2'>
+											<div className='w-12 h-12 rounded-full bg-slate-800 flex items-center justify-center text-lg font-black text-slate-400'>
+												{(user?.username ?? getName())[0]?.toUpperCase()}
 											</div>
-											<p className='text-xs text-slate-500'>
-												{cameraError ? 'Camera unavailable' : 'Camera off'}
-											</p>
+											<p className='text-[10px] text-slate-500'>Camera off</p>
 										</div>
-									) : (
-										<video
-											ref={localVideoRef}
-											autoPlay
-											muted
-											playsInline
-											className='w-full h-full object-cover'
-										/>
 									)}
-									<div className='absolute bottom-3 left-3 flex items-center gap-2 bg-black/60 backdrop-blur px-3 py-1 rounded-full'>
-										<span className='text-xs font-bold'>You</span>
-										<span className='text-[10px] text-blue-400 capitalize'>
-											({user?.role})
+
+									{/* Name badge */}
+									<div className='absolute bottom-3 left-3 flex items-center gap-2 bg-black/60 backdrop-blur px-2.5 py-1 rounded-full'>
+										<span className='text-[10px] font-bold truncate max-w-[120px]'>
+											{user?.username ?? getName()}
+										</span>
+										<span className='text-[9px] text-blue-400 capitalize shrink-0'>
+											({user?.role ?? 'you'})
 										</span>
 									</div>
+
+									{/* Muted indicator */}
 									{audioMuted && (
-										<div className='absolute top-3 right-3 bg-rose-600 rounded-full p-1.5'>
-											<MicOff size={12} />
+										<div className='absolute top-3 right-3 bg-rose-600/90 backdrop-blur rounded-full p-1.5'>
+											<MicOff size={11} />
+										</div>
+									)}
+
+									{/* Screen share indicator */}
+									{screenSharing && (
+										<div className='absolute top-3 left-3 flex items-center gap-1 bg-blue-600/90 px-2 py-1 rounded-full'>
+											<Monitor size={10} />
+											<span className='text-[9px] font-bold'>Sharing</span>
 										</div>
 									)}
 								</div>
 
-								{/* Remote */}
-								<div className='relative bg-slate-900 rounded-2xl border border-white/[0.06] overflow-hidden flex items-center justify-center min-h-[160px]'>
-									<video
-										ref={remoteVideoRef}
-										autoPlay
-										playsInline
-										className={`w-full h-full object-cover ${remoteConnected ? '' : 'hidden'}`}
-									/>
-									{!remoteConnected && (
-										<div className='flex flex-col items-center gap-3 text-center'>
-											<div className='w-14 h-14 rounded-full bg-slate-800 flex items-center justify-center'>
-												<VideoOff size={24} className='text-slate-600' />
-											</div>
-											<p className='text-xs text-slate-500'>
-												Waiting for participant…
-											</p>
+								{/* Remote videos — one div per participant */}
+								{remoteVideos.map(({ uid, username }) => (
+									<div
+										key={uid}
+										className='relative bg-slate-900 rounded-2xl border border-white/[0.06] overflow-hidden flex items-center justify-center min-h-[140px]'
+									>
+										{/* Agora plays the remote track into this div by id */}
+										<div id={`remote-video-${uid}`} className='w-full h-full' />
+										<div className='absolute bottom-3 left-3 bg-black/60 backdrop-blur px-2.5 py-1 rounded-full'>
+											<span className='text-[10px] font-bold truncate max-w-[120px] block'>
+												{username}
+											</span>
 										</div>
-									)}
-									<div className='absolute bottom-3 left-3 bg-black/60 backdrop-blur px-3 py-1 rounded-full'>
-										<span className='text-xs font-bold'>Participant</span>
 									</div>
-								</div>
+								))}
 							</div>
 
-							{/* Media controls */}
-							{!cameraError && (
-								<div className='shrink-0 flex items-center justify-center gap-3 py-1'>
-									<button
-										onClick={toggleAudio}
-										title={audioMuted ? 'Unmute' : 'Mute'}
-										className={`w-11 h-11 rounded-full flex items-center justify-center border transition-all
-											${
-												audioMuted
-													? 'bg-rose-600 border-rose-500 text-white'
-													: 'bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700'
-											}`}
-									>
-										{audioMuted ? <MicOff size={18} /> : <Mic size={18} />}
-									</button>
-									<button
-										onClick={toggleVideo}
-										title={videoOff ? 'Camera on' : 'Camera off'}
-										className={`w-11 h-11 rounded-full flex items-center justify-center border transition-all
-											${
-												videoOff
-													? 'bg-rose-600 border-rose-500 text-white'
-													: 'bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700'
-											}`}
-									>
-										{videoOff ? <VideoOff size={18} /> : <Video size={18} />}
-									</button>
-								</div>
-							)}
+							{/* ── Media controls ── */}
+							<div className='shrink-0 flex items-center justify-center gap-3 py-1'>
+								{/* Mic */}
+								<button
+									onClick={toggleAudio}
+									title={audioMuted ? 'Unmute' : 'Mute'}
+									className={`w-11 h-11 rounded-full flex items-center justify-center border transition-all active:scale-95
+										${
+											audioMuted
+												? 'bg-rose-600 border-rose-500 text-white'
+												: 'bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700'
+										}`}
+								>
+									{audioMuted ? <MicOff size={18} /> : <Mic size={18} />}
+								</button>
+
+								{/* Camera */}
+								<button
+									onClick={toggleVideo}
+									disabled={screenSharing}
+									title={videoOff ? 'Camera on' : 'Camera off'}
+									className={`w-11 h-11 rounded-full flex items-center justify-center border transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed
+										${
+											videoOff
+												? 'bg-rose-600 border-rose-500 text-white'
+												: 'bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700'
+										}`}
+								>
+									{videoOff ? <VideoOff size={18} /> : <Video size={18} />}
+								</button>
+
+								{/* Screen share */}
+								<button
+									onClick={toggleScreenShare}
+									title={screenSharing ? 'Stop sharing' : 'Share screen'}
+									className={`w-11 h-11 rounded-full flex items-center justify-center border transition-all active:scale-95
+										${
+											screenSharing
+												? 'bg-blue-600 border-blue-500 text-white'
+												: 'bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700'
+										}`}
+								>
+									{screenSharing ? (
+										<MonitorOff size={18} />
+									) : (
+										<Monitor size={18} />
+									)}
+								</button>
+
+								{/* Leave shortcut */}
+								<button
+									onClick={leaveRoom}
+									title='Leave room'
+									className='w-11 h-11 rounded-full flex items-center justify-center border bg-rose-600 border-rose-500 text-white hover:bg-rose-500 transition-all active:scale-95 ml-2'
+								>
+									<PhoneOff size={18} />
+								</button>
+							</div>
 						</>
 					) : (
+						/* ── Whiteboard tab ── */
 						<div className='flex-grow min-h-0'>
 							<Whiteboard
 								socket={socket}
@@ -557,18 +690,21 @@ const RoomPage = () => {
 					)}
 				</div>
 
-				{/* ── Chat panel (toggleable, slides in over content on mobile) ── */}
+				{/* ── Chat panel ─────────────────────────────────────────────────────
+				     Mobile: fixed overlay sliding in from the right
+				     Desktop (md+): static sidebar
+				───────────────────────────────────────────────────────────────────── */}
 				<div
 					className={`
-						fixed inset-0 z-50 transition-all duration-300
-						md:relative md:inset-auto md:z-auto md:w-80 md:shrink-0
-						${chatOpen ? 'pointer-events-auto' : 'pointer-events-none md:pointer-events-auto'}
-					`}
+					fixed inset-0 z-50 pointer-events-none
+					md:relative md:inset-auto md:z-auto md:pointer-events-auto
+					md:w-80 md:shrink-0
+				`}
 				>
 					{/* Mobile backdrop */}
 					{chatOpen && (
 						<div
-							className='absolute inset-0 bg-black/60 backdrop-blur-sm md:hidden'
+							className='absolute inset-0 bg-black/60 backdrop-blur-sm pointer-events-auto md:hidden'
 							onClick={() => setChatOpen(false)}
 						/>
 					)}
@@ -576,9 +712,14 @@ const RoomPage = () => {
 					{/* Panel */}
 					<div
 						className={`
+							pointer-events-auto
 							absolute right-0 top-0 h-full w-[85vw] max-w-sm
-							md:relative md:w-full md:max-w-none md:h-auto md:flex
-							flex flex-col bg-slate-900/90 backdrop-blur-xl border-l border-white/[0.06] md:rounded-2xl md:border md:border-white/[0.06] overflow-hidden shadow-2xl
+							md:relative md:w-full md:max-w-none
+							flex flex-col
+							bg-slate-900/95 backdrop-blur-xl
+							border-l border-white/[0.06]
+							md:rounded-2xl md:border md:border-white/[0.06]
+							overflow-hidden shadow-2xl
 							transition-transform duration-300 ease-out
 							${chatOpen ? 'translate-x-0' : 'translate-x-full md:translate-x-0'}
 						`}
@@ -595,13 +736,13 @@ const RoomPage = () => {
 							</span>
 							<button
 								onClick={() => setChatOpen(false)}
-								className='md:hidden w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 flex items-center justify-center ml-1'
+								className='md:hidden w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 flex items-center justify-center ml-1 transition-all'
 							>
 								<X size={14} className='text-slate-400' />
 							</button>
 						</div>
 
-						{/* Messages */}
+						{/* Messages list */}
 						<div className='flex-grow overflow-y-auto p-4 space-y-4'>
 							{messages.length === 0 && (
 								<p className='text-center text-xs text-slate-600 mt-10'>
@@ -618,7 +759,8 @@ const RoomPage = () => {
 										</div>
 									)
 								}
-								const isSelf = m.isSelf || m.sender === user?.username
+								const isSelf =
+									m.isSelf || m.sender === (user?.username ?? getName())
 								return (
 									<div
 										key={i}
@@ -643,7 +785,7 @@ const RoomPage = () => {
 							<div ref={messagesEndRef} />
 						</div>
 
-						{/* Input */}
+						{/* Message input */}
 						<div className='p-3 border-t border-white/[0.06] flex gap-2 shrink-0'>
 							<input
 								value={input}
